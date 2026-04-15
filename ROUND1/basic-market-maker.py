@@ -33,6 +33,10 @@ QUOTE_SIZES: Dict[str, int] = {
     PEPPER: 10,
 }
 
+SESSION_LENGTH_TS = 1_000_000
+PEPPER_DRIFT_PER_TICK = 0.001
+PEPPER_REVERSION_PREMIUM = 3
+
 DEFAULT_CONVERSION = 0
 
 
@@ -244,8 +248,12 @@ class ProductTrader:
         ask_price = quote_center + half_spread
 
         best_bid, best_ask = self.best_bid_ask()
-        bid_price = min(bid_price, best_bid)
-        ask_price = max(ask_price, best_ask)
+        if best_bid + 1 < best_ask:
+            bid_price = min(bid_price, best_bid + 1)
+            ask_price = max(ask_price, best_ask - 1)
+        else:
+            bid_price = min(bid_price, best_bid)
+            ask_price = max(ask_price, best_ask)
 
         if bid_price >= ask_price:
             bid_price = best_bid
@@ -277,7 +285,48 @@ class PepperTrader(ProductTrader):
         super().__init__(PEPPER, state, trader_data)
 
     def get_orders(self) -> List[Order]:
-        self.make_basic_market()
+        # self.make_basic_market()
+        if not self.has_book:
+            return self.orders
+
+        best_bid, best_ask = self.best_bid_ask()
+        mid_price = self.mid_price()
+        remaining_time = max(0, SESSION_LENGTH_TS - self.state.timestamp)
+        forward_fair_value = mid_price + PEPPER_DRIFT_PER_TICK * remaining_time
+
+        self.set_trader_data("last_forward_fair_value", forward_fair_value)
+
+        assert self.order_depth is not None
+
+        remaining_buy_capacity = self.buy_capacity
+        for ask_price in sorted(self.order_depth.sell_orders):
+            if remaining_buy_capacity <= 0 or ask_price > forward_fair_value:
+                break
+
+            available = -self.order_depth.sell_orders[ask_price]
+            quantity = min(available, remaining_buy_capacity)
+            if quantity > 0:
+                self.orders.append(Order(self.product, ask_price, quantity))
+                remaining_buy_capacity -= quantity
+
+        remaining_sell_capacity = self.sell_capacity
+        sell_threshold = forward_fair_value + PEPPER_REVERSION_PREMIUM
+        for bid_price in sorted(self.order_depth.buy_orders, reverse=True):
+            if remaining_sell_capacity <= 0 or bid_price < sell_threshold:
+                break
+
+            available = self.order_depth.buy_orders[bid_price]
+            quantity = min(available, remaining_sell_capacity)
+            if quantity > 0:
+                self.orders.append(Order(self.product, bid_price, -quantity))
+                remaining_sell_capacity -= quantity
+
+        if remaining_buy_capacity > 0 and best_bid + 1 < best_ask:
+            passive_bid = min(best_bid + 1, int(forward_fair_value) - 1)
+            if passive_bid > best_bid:
+                quantity = min(self.quote_size(), remaining_buy_capacity)
+                self.orders.append(Order(self.product, passive_bid, quantity))
+
         return self.orders
 
 
