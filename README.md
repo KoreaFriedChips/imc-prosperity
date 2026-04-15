@@ -46,10 +46,13 @@ python -m backtest --help
 Example usage:
 
 ```bash
+python3 -m backtest round1/basic-market-maker.py 1 --out backtests/latest.log --no-vis
 python -m backtest run round1/trader.py 1
 python -m backtest run round1/trader.py 1-0
 python -m backtest run round1/agro.py 1 --no-vis --print
 ```
+
+Then go on <https://matthewnapoli.github.io/imc-prosperity-4-visualizer/visualizer> and you can upload the log
 
 How the day arguments work:
 
