@@ -279,5 +279,6 @@ class Trader:
         for product_trader in traders:
             result[product_trader.product] = product_trader.get_orders()
 
-        logger.flush(state, result, DEFAULT_CONVERSION, trader_data)
-        return result, DEFAULT_CONVERSION, json.dumps(trader_data)
+        trader_data_json = json.dumps(trader_data)
+        logger.flush(state, result, DEFAULT_CONVERSION, trader_data_json)
+        return result, DEFAULT_CONVERSION, trader_data_json
