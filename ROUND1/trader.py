@@ -174,6 +174,7 @@ class PepperTrader(ProductTrader):
             passive_bid = min(best_bid + 1, int(ema))
             self.orders.append(Order(self.product, passive_bid, remaining_buy_capacity))
 
+        # return []
         return self.orders
 
 
