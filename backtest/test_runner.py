@@ -1,5 +1,6 @@
 from contextlib import closing, redirect_stdout
 from io import StringIO
+import sys
 from IPython.utils.io import Tee
 from tqdm import tqdm
 from backtest.constants import LIMITS
@@ -66,15 +67,63 @@ class TestRunner:
                 orders, conversions, trader_data = self.trader.run(state)
 
         state.traderData = trader_data
+        lambda_log = stdout.getvalue().rstrip()
+        if not lambda_log:
+            lambda_log = self.__build_lambda_log(state, orders, conversions, trader_data)
 
         sandbox_row = SandboxLogRow(
             timestamp=timestamp,
             sandbox_log="",
-            lambda_log=stdout.getvalue().rstrip(),
+            lambda_log=lambda_log,
         )
         result.sandbox_logs.append(sandbox_row)
 
         return orders
+
+
+    def __build_lambda_log(
+        self,
+        state: TradingState,
+        orders: dict[Symbol, list[Order]],
+        conversions: int,
+        trader_data: str,
+    ) -> str:
+        trader_module = sys.modules.get(self.trader.__class__.__module__)
+        logger = getattr(trader_module, "logger", None)
+        if logger is None:
+            return ""
+
+        required_methods = (
+            "compress_state",
+            "compress_orders",
+            "truncate",
+            "to_json",
+        )
+        if any(not hasattr(logger, method) for method in required_methods):
+            return ""
+
+        base_length = len(
+            logger.to_json(
+                [
+                    logger.compress_state(state, ""),
+                    logger.compress_orders(orders),
+                    conversions,
+                    "",
+                    "",
+                ]
+            )
+        )
+        max_item_length = (logger.max_log_length - base_length) // 3
+
+        return logger.to_json(
+            [
+                logger.compress_state(state, logger.truncate(state.traderData, max_item_length)),
+                logger.compress_orders(orders),
+                conversions,
+                logger.truncate(trader_data, max_item_length),
+                logger.truncate(logger.logs, max_item_length),
+            ]
+        )
 
 
     def __initialize_trade_state(self, state: TradingState, data: BacktestData, timestamp: int) -> TradingState:
