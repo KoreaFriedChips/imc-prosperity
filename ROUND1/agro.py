@@ -1,35 +1,145 @@
 """
-Round 1 Trader - ASH_COATED_OSMIUM and INTARIAN_PEPPER_ROOT (v3 "ultra")
+Round 1 trader using the shared template architecture.
 
-V2 live result: ~10,500 PnL (pepper ~7,286 + osmium ~2,768).
-Pepper is near-optimal (90% of theoretical max). The remaining upside is
-almost entirely on the OSMIUM scalper:
-  - v2 fills cluster at 9994/10003 (one tick inside top-of-book), capturing
-    ~6 PnL per round-trip x 472 trades = 2,768.
-  - The passive fill RATE is the bottleneck, not the edge per fill.
-
-v3 changes (more aggressive)
-----------------------------
-OSMIUM
-  * Quote at FIXED 9999 bid / 10001 ask (the tightest possible around 10000
-    mean), instead of penny-jumping the best_bid/best_ask. This maximises
-    the number of times the book trades through our resting orders.
-  * Multi-level resting quotes: post extra size 2 and 4 ticks deeper on
-    each side to catch bigger mean-reversion swings.
-  * take_edge = 0 (grab any ask <= 9999 or bid >= 10001).
-  * Keep inventory skew so we don't over-accumulate a side.
-
-PEPPER
-  * Keep the aggressive buy-and-hold (already near-optimal) but widen the
-    max_buy_price cap so we'll chase a sudden ramp. Raise premium cap to 40.
-  * Instead of passive bid at best_bid+1, pyramid-bid: stack resting bids
-    at best_bid+1, best_bid, and one tick below so we scoop any dip.
+This keeps the aggressive ASH_COATED_OSMIUM and INTARIAN_PEPPER_ROOT
+strategy logic, but refactors the file to follow `template.py`:
+  * shared Logger
+  * shared ProductTrader base class
+  * product-specific trader classes
+  * persistent traderData storage
+  * central Trader.run() entry point
 """
 
 import json
 from typing import Any, Dict, List, Sequence, Tuple
 
-from datamodel import Order, OrderDepth, TradingState
+from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+
+
+class Logger:
+    def __init__(self) -> None:
+        self.logs = ""
+        self.max_log_length = 3750
+
+    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
+        self.logs += sep.join(map(str, objects)) + end
+
+    def flush(self, state: TradingState, orders: dict[Symbol, list[Order]], conversions: int, trader_data: str) -> None:
+        base_length = len(
+            self.to_json(
+                [
+                    self.compress_state(state, ""),
+                    self.compress_orders(orders),
+                    conversions,
+                    "",
+                    "",
+                ]
+            )
+        )
+
+        max_item_length = (self.max_log_length - base_length) // 3
+
+        print(
+            self.to_json(
+                [
+                    self.compress_state(state, self.truncate(state.traderData, max_item_length)),
+                    self.compress_orders(orders),
+                    conversions,
+                    self.truncate(trader_data, max_item_length),
+                    self.truncate(self.logs, max_item_length),
+                ]
+            )
+        )
+
+        self.logs = ""
+
+    def compress_state(self, state: TradingState, trader_data: str) -> list[Any]:
+        return [
+            state.timestamp,
+            trader_data,
+            self.compress_listings(state.listings),
+            self.compress_order_depths(state.order_depths),
+            self.compress_trades(state.own_trades),
+            self.compress_trades(state.market_trades),
+            state.position,
+            self.compress_observations(state.observations),
+        ]
+
+    def compress_listings(self, listings: dict[Symbol, Listing]) -> list[list[Any]]:
+        compressed = []
+        for listing in listings.values():
+            compressed.append([listing.symbol, listing.product, listing.denomination])
+        return compressed
+
+    def compress_order_depths(self, order_depths: dict[Symbol, OrderDepth]) -> dict[Symbol, list[Any]]:
+        compressed = {}
+        for symbol, order_depth in order_depths.items():
+            compressed[symbol] = [order_depth.buy_orders, order_depth.sell_orders]
+        return compressed
+
+    def compress_trades(self, trades: dict[Symbol, list[Trade]]) -> list[list[Any]]:
+        compressed = []
+        for arr in trades.values():
+            for trade in arr:
+                compressed.append(
+                    [
+                        trade.symbol,
+                        trade.price,
+                        trade.quantity,
+                        trade.buyer,
+                        trade.seller,
+                        trade.timestamp,
+                    ]
+                )
+        return compressed
+
+    def compress_observations(self, observations: Observation) -> list[Any]:
+        conversion_observations = {}
+        for product, observation in observations.conversionObservations.items():
+            conversion_observations[product] = [
+                observation.bidPrice,
+                observation.askPrice,
+                observation.transportFees,
+                observation.exportTariff,
+                observation.importTariff,
+                observation.sugarPrice,
+                observation.sunlightIndex,
+            ]
+        return [observations.plainValueObservations, conversion_observations]
+
+    def compress_orders(self, orders: dict[Symbol, list[Order]]) -> list[list[Any]]:
+        compressed = []
+        for arr in orders.values():
+            for order in arr:
+                compressed.append([order.symbol, order.price, order.quantity])
+        return compressed
+
+    def to_json(self, value: Any) -> str:
+        return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
+
+    def truncate(self, value: str, max_length: int) -> str:
+        lo, hi = 0, min(len(value), max_length)
+        out = ""
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+
+            candidate = value[:mid]
+            if len(candidate) < len(value):
+                candidate += "..."
+
+            encoded_candidate = json.dumps(candidate)
+
+            if len(encoded_candidate) <= max_length:
+                out = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        return out
+
+
+logger = Logger()
 
 
 OSMIUM = "ASH_COATED_OSMIUM"
@@ -52,11 +162,11 @@ class ProductTrader:
         self,
         product: str,
         state: TradingState,
-        memory: Dict[str, Any],
+        trader_data: Dict[str, Any],
     ) -> None:
         self.product = product
         self.state = state
-        self.memory = memory
+        self.trader_data = trader_data
         self.order_depth = state.order_depths.get(product)
         self.position = state.position.get(product, 0)
         self.position_limit = POSITION_LIMITS.get(product, 20)
@@ -78,11 +188,11 @@ class ProductTrader:
     def sell_capacity(self) -> int:
         return self.position_limit + self.position
 
-    def get_memory(self, key: str, default: Any) -> Any:
-        return self.memory.get(f"{self.product}_{key}", default)
+    def get_trader_data(self, key: str, default: Any) -> Any:
+        return self.trader_data.get(f"{self.product}_{key}", default)
 
-    def set_memory(self, key: str, value: Any) -> None:
-        self.memory[f"{self.product}_{key}"] = value
+    def set_trader_data(self, key: str, value: Any) -> None:
+        self.trader_data[f"{self.product}_{key}"] = value
 
     def best_bid_ask(self) -> Tuple[int, int]:
         assert self.order_depth is not None
@@ -174,61 +284,18 @@ class ProductTrader:
         return self.orders
 
 
-class PepperTrader(ProductTrader):
-    def __init__(self, state: TradingState, memory: Dict[str, Any]) -> None:
-        super().__init__(PEPPER, state, memory)
-
-    def get_orders(self) -> List[Order]:
-        if not self.has_book:
-            return self.orders
-
-        micro = self.micro_price()
-        previous_ema = self.get_memory("ema", micro)
-        ema = self.ema(previous_ema, micro, 0.5)
-        self.set_memory("ema", ema)
-
-        remaining_time = max(0, SESSION_LENGTH_TS - self.state.timestamp)
-        forward_drift = PEPPER_DRIFT * remaining_time * 0.6
-        forward_fair_value = ema + forward_drift
-
-        max_premium = min(forward_drift, 40.0)
-        max_buy_price = ema + max_premium
-
-        remaining_buy_capacity = self.take_asks(max_buy_price, self.buy_capacity)
-        self.take_bids(forward_fair_value + 3, self.sell_capacity)
-
-        if remaining_buy_capacity > 0:
-            best_bid, _ = self.best_bid_ask()
-            top_bid = min(best_bid + 1, int(ema))
-            bid_levels = [
-                (top_bid, 0.5),
-                (top_bid - 1, 0.3),
-                (top_bid - 2, 0.2),
-            ]
-            valid_bid_levels = [
-                (price, weight) for price, weight in bid_levels if price >= 1
-            ]
-            self.place_weighted_ladder(
-                valid_bid_levels,
-                remaining_buy_capacity,
-                is_buy=True,
-            )
-
-        return self.orders
-
-
 class OsmiumTrader(ProductTrader):
-    def __init__(self, state: TradingState, memory: Dict[str, Any]) -> None:
-        super().__init__(OSMIUM, state, memory)
+    def __init__(self, state: TradingState, trader_data: Dict[str, Any]) -> None:
+        super().__init__(OSMIUM, state, trader_data)
 
     def get_orders(self) -> List[Order]:
         if not self.has_book:
             return self.orders
 
         micro = self.micro_price()
-        previous_ema = self.get_memory("ema", micro)
+        previous_ema = self.get_trader_data("ema", micro)
         ema = self.ema(previous_ema, micro, 0.08)
-        self.set_memory("ema", ema)
+        self.set_trader_data("ema", ema)
 
         anchor_weight = 0.8
         fair_value = (1 - anchor_weight) * ema + anchor_weight * OSMIUM_ANCHOR
@@ -283,22 +350,66 @@ class OsmiumTrader(ProductTrader):
         return self.orders
 
 
+class PepperTrader(ProductTrader):
+    def __init__(self, state: TradingState, trader_data: Dict[str, Any]) -> None:
+        super().__init__(PEPPER, state, trader_data)
+
+    def get_orders(self) -> List[Order]:
+        if not self.has_book:
+            return self.orders
+
+        micro = self.micro_price()
+        previous_ema = self.get_trader_data("ema", micro)
+        ema = self.ema(previous_ema, micro, 0.5)
+        self.set_trader_data("ema", ema)
+
+        remaining_time = max(0, SESSION_LENGTH_TS - self.state.timestamp)
+        forward_drift = PEPPER_DRIFT * remaining_time * 0.6
+        forward_fair_value = ema + forward_drift
+
+        max_premium = min(forward_drift, 40.0)
+        max_buy_price = ema + max_premium
+
+        remaining_buy_capacity = self.take_asks(max_buy_price, self.buy_capacity)
+        self.take_bids(forward_fair_value + 3, self.sell_capacity)
+
+        if remaining_buy_capacity > 0:
+            best_bid, _ = self.best_bid_ask()
+            top_bid = min(best_bid + 1, int(ema))
+            bid_levels = [
+                (top_bid, 0.5),
+                (top_bid - 1, 0.3),
+                (top_bid - 2, 0.2),
+            ]
+            valid_bid_levels = [
+                (price, weight) for price, weight in bid_levels if price >= 1
+            ]
+            self.place_weighted_ladder(
+                valid_bid_levels,
+                remaining_buy_capacity,
+                is_buy=True,
+            )
+
+        return self.orders
+
+
 class Trader:
     @staticmethod
-    def _load_memory(state: TradingState) -> Dict[str, Any]:
+    def _load_trader_data(state: TradingState) -> Dict[str, Any]:
         if not state.traderData:
             return {}
 
         try:
             return json.loads(state.traderData)
         except Exception:
+            logger.print("Failed to parse traderData; resetting state")
             return {}
 
     def run(self, state: TradingState):
-        memory = self._load_memory(state)
+        trader_data = self._load_trader_data(state)
         traders = [
-            PepperTrader(state, memory),
-            OsmiumTrader(state, memory),
+            OsmiumTrader(state, trader_data),
+            PepperTrader(state, trader_data),
         ]
 
         result: Dict[str, List[Order]] = {
@@ -308,4 +419,6 @@ class Trader:
         for product_trader in traders:
             result[product_trader.product] = product_trader.get_orders()
 
-        return result, DEFAULT_CONVERSION, json.dumps(memory)
+        serialized_trader_data = json.dumps(trader_data)
+        logger.flush(state, result, DEFAULT_CONVERSION, serialized_trader_data)
+        return result, DEFAULT_CONVERSION, serialized_trader_data
