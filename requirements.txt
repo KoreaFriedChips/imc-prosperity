@@ -1,0 +1,6 @@
+typer
+tqdm
+ipython
+jsonpickle
+orjson
+numpy
